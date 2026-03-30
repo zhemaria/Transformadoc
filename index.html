@@ -1900,35 +1900,112 @@ const CONV={
     const buf=await readBuf(inp);
     const pdf=await pdfjsLib.getDocument({data:new Uint8Array(buf)}).promise;
     const title=inp.name.replace(/\.pdf$/i,'');
+    const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     let sectionsHtml='';
 
     for(let p=1;p<=pdf.numPages;p++){
-      const page=await pdf.getPage(p);
-      const tc=await page.getTextContent();
-      let pageText='';
-      let line='', lastY=null;
+      const page  = await pdf.getPage(p);
+      const tc    = await page.getTextContent();
+      const vp    = page.getViewport({scale:1});
+      const pgH   = vp.height;
+
+      /* ── 1. Recopilar fragmentos con sus coordenadas ── */
+      const frags=[];
       tc.items.forEach(item=>{
-        if(!('str' in item)) return;
-        const y=item.transform?item.transform[5]:0;
-        if(lastY!==null && Math.abs(y-lastY)>4){
-          if(line.trim()){
-            const esc=line.trim().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-            pageText+=`<p>${esc}</p>\n`;
-          }
-          line=item.str;
-        } else { line+=item.str; }
-        lastY=y;
+        if(!('str' in item) || !item.str.trim()) return;
+        const y   = pgH - (item.transform?item.transform[5]:0); // invertir eje Y
+        const h   = item.height || Math.abs(item.transform?item.transform[3]:12);
+        const x   = item.transform?item.transform[4]:0;
+        frags.push({str:item.str, y, h, x});
       });
-      if(line.trim()){
-        const esc=line.trim().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        pageText+=`<p>${esc}</p>\n`;
+      if(!frags.length){
+        sectionsHtml+=`
+          <section class="pdf-page" id="p${p}" aria-label="Página ${p} de ${pdf.numPages}">
+            <div class="pdf-page-label"><span>Página ${p}</span><span>de ${pdf.numPages}</span></div>
+            <p class="dua-empty">[Página sin texto extraíble]</p>
+          </section>`;
+        continue;
       }
+
+      /* ── 2. Agrupar fragmentos en líneas (mismo Y ± tolerancia) ── */
+      const TOL = 3; // puntos de tolerancia vertical
+      const lines=[];
+      frags.forEach(fr=>{
+        const last=lines[lines.length-1];
+        if(last && Math.abs(fr.y - last.y) <= TOL){
+          last.parts.push(fr);
+          last.y=(last.y+fr.y)/2; // promedio para acumular
+        } else {
+          lines.push({y:fr.y, h:fr.h, parts:[fr]});
+        }
+      });
+      // Ordenar líneas por Y (top-down)
+      lines.sort((a,b)=>a.y-b.y);
+
+      /* ── 3. Calcular interlineado normal del documento ── */
+      const gaps=[];
+      for(let i=1;i<lines.length;i++){
+        gaps.push(lines[i].y - lines[i-1].y);
+      }
+      gaps.sort((a,b)=>a-b);
+      // Mediana de gaps = interlineado normal
+      const medGap = gaps.length ? gaps[Math.floor(gaps.length/2)] : 14;
+      // Un salto > 1.8× el interlineado normal = párrafo nuevo
+      const PARA_THRESH = medGap * 1.8;
+
+      /* ── 4. Construir texto: unir palabras de línea, detectar párrafos ── */
+      let pageHtml='';
+      let curPara='';
+
+      lines.forEach((line,i)=>{
+        // Ordenar partes de izquierda a derecha
+        line.parts.sort((a,b)=>a.x-b.x);
+        // Unir partes de la línea con espacio inteligente
+        let lineStr='';
+        line.parts.forEach((fr,j)=>{
+          if(j===0){ lineStr=fr.str; return; }
+          // Si el fragmento ya empieza con espacio o el anterior termina con uno, no agregar
+          const needsSpace = !lineStr.endsWith(' ') && !fr.str.startsWith(' ');
+          lineStr += (needsSpace?' ':'')+fr.str;
+        });
+        lineStr=lineStr.trim();
+        if(!lineStr) return;
+
+        // Determinar si hay salto de párrafo antes de esta línea
+        const gapBefore = i>0 ? line.y - lines[i-1].y : 0;
+        const isNewPara = i>0 && gapBefore > PARA_THRESH;
+
+        if(isNewPara){
+          // Cerrar párrafo actual
+          if(curPara.trim()){
+            pageHtml+=`<p>${esc(curPara.trim())}</p>\n`;
+          }
+          curPara=lineStr;
+        } else {
+          // Misma línea o salto normal → unir con espacio
+          if(curPara){
+            // Si la línea anterior termina con guión, unir sin espacio
+            if(curPara.endsWith('-')){
+              curPara=curPara.slice(0,-1)+lineStr;
+            } else {
+              curPara+=' '+lineStr;
+            }
+          } else {
+            curPara=lineStr;
+          }
+        }
+      });
+      // Último párrafo
+      if(curPara.trim()){
+        pageHtml+=`<p>${esc(curPara.trim())}</p>\n`;
+      }
+
       sectionsHtml+=`
         <section class="pdf-page" id="p${p}" aria-label="Página ${p} de ${pdf.numPages}">
           <div class="pdf-page-label">
             <span>Página ${p}</span><span>de ${pdf.numPages}</span>
           </div>
-          ${pageText||'<p class="dua-empty">[Página sin texto extraíble]</p>'}
+          ${pageHtml||'<p class="dua-empty">[Página sin texto extraíble]</p>'}
         </section>`;
     }
 
